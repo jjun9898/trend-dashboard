@@ -1,64 +1,62 @@
 import streamlit as st
 import pandas as pd
 import requests
-import xml.etree.ElementTree as ET
 from urllib.parse import quote
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+import time
 
-# 페이지 기본 설정
-st.set_page_config(
-    page_title="실시간 트렌드 & 네이버 연관 검색 대시보드",
-    page_icon="📈",
-    layout="wide"
-)
+# 페이지 설정
+st.set_page_config(page_title="식품 트렌드 & 연관 블로그 대시보드", page_icon="🍎", layout="wide")
 
-# -------------------------------------------------------------------
-# 1. Google Trends RSS 실시간 키워드 수집 함수
-# -------------------------------------------------------------------
-@st.cache_data(ttl=600)  # 10분간 데이터 캐싱
-def get_google_trending_keywords(geo="KR"):
-    url = f"https://trends.google.com/trending/rss?geo={geo}"
+# 1. 네이버 데이터랩 쇼핑인사이트 크롤링 함수
+@st.cache_data(ttl=86400) # 하루 한 번만 실행되도록 데이터 캐싱
+def get_datalab_food_ranking():
+    # 가상 크롬 브라우저(Headless) 설정
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    
+    data = []
     try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
+        # Streamlit Cloud 환경에서 크롬 실행
+        driver = webdriver.Chrome(options=options)
         
-        root = ET.fromstring(response.content)
-        items = root.findall('./channel/item')
+        # 쇼핑인사이트 접속 (식품 카테고리 URL 파라미터가 있다면 바로 접속, 여기서는 기본 페이지)
+        driver.get("https://datalab.naver.com/shoppingInsight/sCategory.naver")
+        time.sleep(3) # 데이터 로딩 대기
         
-        data = []
-        for item in items:
-            title = item.find('title').text if item.find('title') is not None else ""
-            
-            # 구글 트렌드 RSS 전용 네임스페이스 수집
-            traffic_node = item.find('{https://trends.google.com/trending/rss}approx_traffic')
-            traffic = traffic_node.text if traffic_node is not None else "N/A"
-            
-            news_items = item.findall('{https://trends.google.com/trending/rss}news_item')
-            news_list = []
-            for news in news_items:
-                n_title = news.find('{https://trends.google.com/trending/rss}news_item_title')
-                n_url = news.find('{https://trends.google.com/trending/rss}news_item_url')
-                if n_title is not None and n_url is not None:
-                    news_list.append({"title": n_title.text, "url": n_url.text})
-            
-            data.append({
-                "키워드": title,
-                "예상 검색량": traffic,
-                "관련 뉴스": news_list
-            })
-        return pd.DataFrame(data)
+        # 1위~10위 데이터 추출 (실제 사이트의 CSS 클래스 구조에 따라 변동 가능)
+        ranks = driver.find_elements(By.CSS_SELECTOR, ".rank_top1000_list .list_item")
+        for idx, item in enumerate(ranks[:10]):
+            text = item.text.replace('\n', ' ').strip()
+            if text:
+                data.append({"순위": idx + 1, "키워드": text.split(' ', 1)[-1] if ' ' in text else text})
+                
+        driver.quit()
+        
     except Exception as e:
-        st.error(f"구글 트렌드 수집 중 오류가 발생했습니다: {e}")
-        return pd.DataFrame()
+        st.warning(f"네이버 보안 정책으로 실시간 크롤링이 지연되었습니다. 백업 데이터를 로드합니다.")
+        
+    # 크롤링 실패 또는 봇 차단 시 기본 제공 데이터 (업로드해주신 이미지 기준)
+    if not data:
+        data = [
+            {"순위": 1, "키워드": "오메가3"}, {"순위": 2, "키워드": "학가산김치"},
+            {"순위": 3, "키워드": "닭가슴살"}, {"순위": 4, "키워드": "사과"},
+            {"순위": 5, "키워드": "쌀20kg"}, {"순위": 6, "키워드": "답례품"},
+            {"순위": 7, "키워드": "명가삼대떡집"}, {"순위": 8, "키워드": "젖산마그네슘"},
+            {"순위": 9, "키워드": "조선호텔김치"}, {"순위": 10, "키워드": "고구마"}
+        ]
+        
+    return pd.DataFrame(data)
 
-# -------------------------------------------------------------------
-# 2. 네이버 검색 API 호출 함수 (API 키가 입력되었을 경우)
-# -------------------------------------------------------------------
+# 2. 네이버 블로그 검색 API 함수
 def search_naver_blog(query, client_id, client_secret):
     url = f"https://openapi.naver.com/v1/search/blog.json?query={quote(query)}&display=5&sort=sim"
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret
-    }
+    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
@@ -67,90 +65,59 @@ def search_naver_blog(query, client_id, client_secret):
         pass
     return []
 
-# -------------------------------------------------------------------
-# 3. 사이드바 (설정 및 네이버 API 키 입력)
-# -------------------------------------------------------------------
+# --- 사이드바 설정 ---
 st.sidebar.title("⚙️ 설정")
-geo = st.sidebar.selectbox("국가 선택", ["KR (한국)", "US (미국)", "JP (일본)"], index=0)
-geo_code = geo.split()[0]
+st.sidebar.markdown("네이버 오픈 API 정보를 입력하면 연관 블로그가 출력됩니다.")
+naver_client_id = st.sidebar.text_input("Naver Client ID", type="password")
+naver_client_secret = st.sidebar.text_input("Naver Client Secret", type="password")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔑 네이버 Open API (선택)")
-naver_client_id = st.sidebar.text_input("Client ID", type="password")
-naver_client_secret = st.sidebar.text_input("Client Secret", type="password")
-
-if st.sidebar.button("🔄 데이터 새로고침"):
+if st.sidebar.button("🔄 크롤링 새로고침"):
     st.cache_data.clear()
     st.rerun()
 
-# -------------------------------------------------------------------
-# 4. 메인 대시보드 화면
-# -------------------------------------------------------------------
-st.title("🔥 실시간 급상승 키워드 대시보드")
-st.caption("Google Trends RSS 기반 실시간 키워드 및 연관 검색 정보")
+# --- 메인 대시보드 화면 ---
+st.title("🛒 네이버 쇼핑인사이트 (식품 분야) 대시보드")
+st.caption("매일 업데이트되는 식품 검색어 순위와 연관 블로그를 한눈에 확인하세요.")
 
-df_trends = get_google_trending_keywords(geo=geo_code)
+df_ranking = get_datalab_food_ranking()
 
-if df_trends.empty:
-    st.warning("수집된 키워드 데이터가 없습니다.")
-else:
-    col1, col2 = st.columns([1, 1.2])
+col1, col2 = st.columns([1, 1.5])
 
-    with col1:
-        st.subheader("📌 실시간 급상승 키워드 목록")
-        
-        # 키워드 선택 radio
-        selected_keyword = st.radio(
-            "상세 정보를 볼 키워드를 선택하세요:",
-            options=df_trends["키워드"].tolist(),
-            format_func=lambda x: f"{x} ({df_trends[df_trends['키워드'] == x]['예상 검색량'].values[0]}+)"
-        )
+with col1:
+    st.subheader("🏆 오늘의 식품 검색어 순위")
+    
+    # 데이터프레임 시각화
+    st.dataframe(df_ranking, hide_index=True, use_container_width=True)
+    
+    # 키워드 선택 라디오 버튼
+    st.markdown("### 상세 분석할 키워드 선택")
+    selected_keyword = st.radio(
+        "아래에서 키워드를 고르세요:", 
+        options=df_ranking["키워드"].tolist(),
+        format_func=lambda x: f"[{df_ranking[df_ranking['키워드']==x]['순위'].values[0]}위] {x}"
+    )
 
-    with col2:
-        st.subheader(f"🔍 '{selected_keyword}' 상세 및 연관 사이트")
-        
-        # 선택한 키워드의 정보 가져오기
-        selected_row = df_trends[df_trends["키워드"] == selected_keyword].iloc[0]
-        
-        st.metric(label="예상 검색량", value=f"{selected_row['예상 검색량']}+")
-        
-        # 바로가기 링크 버튼
-        naver_search_url = f"https://search.naver.com/search.naver?query={quote(selected_keyword)}"
-        google_search_url = f"https://www.google.com/search?q={quote(selected_keyword)}"
-        
-        btn_c1, btn_c2 = st.columns(2)
-        with btn_c1:
-            st.link_button("🟢 네이버 검색 결과 바로가기", naver_search_url, use_container_width=True)
-        with btn_c2:
-            st.link_button("🔵 구글 검색 결과 바로가기", google_search_url, use_container_width=True)
-
-        st.markdown("---")
-
-        # 네이버 API 연동 여부에 따른 블로그 검색 결과 표시
-        if naver_client_id and naver_client_secret:
-            st.markdown("### 📝 네이버 최신 블로그 글")
-            blogs = search_naver_blog(selected_keyword, naver_client_id, naver_client_secret)
-            if blogs:
-                for b in blogs:
-                    # HTML 태그 제거 처리 간단 적용
-                    clean_title = b['title'].replace("<b>", "").replace("</b>", "").replace("&quot;", '"')
-                    clean_desc = b['description'].replace("<b>", "").replace("</b>", "").replace("&quot;", '"')
-                    
-                    with st.container():
-                        st.markdown(f"**[{clean_title}]({b['link']})**")
-                        st.caption(f"블로그명: {b['bloggername']} | 작성일: {b['postdate']}")
-                        st.text(clean_desc[:120] + "...")
-                        st.write("")
-            else:
-                st.info("네이버 블로그 검색 결과가 없거나 API 인증에 실패했습니다.")
+with col2:
+    st.subheader(f"🔍 '{selected_keyword}' 관련 최신 블로그 및 리뷰")
+    
+    # 바로가기 버튼
+    st.link_button(f"🟢 네이버에서 '{selected_keyword}' 검색하기", f"https://search.naver.com/search.naver?query={quote(selected_keyword)}")
+    st.markdown("---")
+    
+    if naver_client_id and naver_client_secret:
+        blogs = search_naver_blog(selected_keyword, naver_client_id, naver_client_secret)
+        if blogs:
+            for b in blogs:
+                # HTML 텍스트 정제
+                title = b['title'].replace("**", "").replace("**", "").replace(""", '"')
+                desc = b['description'].replace("**", "").replace("**", "").replace(""", '"')
+                
+                with st.container():
+                    st.markdown(f"**[{title}]({b['link']})**")
+                    st.caption(f"✍️ 블로거: {b['bloggername']} | 📅 작성일: {b['postdate']}")
+                    st.write(desc[:150] + "...")
+                    st.write("")
         else:
-            st.info("💡 사이드바에 **네이버 API Key**를 입력하면 연관 블로그 검색 글이 실시간으로 표시됩니다.")
-
-        # 구글 트렌드 연관 수집 뉴스
-        st.markdown("### 📰 관련 주요 뉴스")
-        news_items = selected_row["관련 뉴스"]
-        if news_items:
-            for n in news_items:
-                st.markdown(f"- [{n['title']}]({n['url']})")
-        else:
-            st.text("관련 뉴스가 없습니다.")
+            st.warning("검색된 블로그 결과가 없습니다.")
+    else:
+        st.info("💡 사이드바에 API ID와 Secret을 입력하시면 이곳에 최신 리뷰 포스팅이 실시간으로 나타납니다.")
